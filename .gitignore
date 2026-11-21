@@ -9,6 +9,10 @@ __pycache__/
 # Generated report (anyone can recreate it by running the script)
 salida/
 
+# Third-party test datasets (their license does not allow re-publishing)
+pruebas_kaggle/
+salida_kaggle/
+
 # Temporary lock files Excel creates while a file is open
 ~$*
 

@@ -63,8 +63,8 @@ Report saved to: ...\salida\reporte_consolidado.xlsx
 
 | Sheet | Content |
 |---|---|
-| **Clean data** | All rows unified with standard columns: `date, seller, category, product, amount, source_file, source_row` |
-| **Summary** | Sales by month × category (with totals), sales by seller (count, total, average) and number of corrections by type |
+| **Clean data** | All rows unified with standard columns: `date, seller, category, product, amount, currency, source_file, source_row` |
+| **Summary** | Sales by month × category (with totals), by seller and by product (count, total, average) and number of corrections by type |
 | **Corrections log** | Every change, one per line: file, row, column, action, value before, value after |
 
 **Summary**
@@ -84,11 +84,13 @@ Report saved to: ...\salida\reporte_consolidado.xlsx
 - Reads **`.xlsx` and `.csv`** files from a folder
 - Detects the CSV **separator** (`,` or `;`) and **encoding** (UTF-8 or Windows) automatically
 - Finds the **real header row** even when there are titles above the table
-- Maps different column names to a standard set via a simple **synonyms dictionary**
-- Cleans text (spaces, capitalization) and **unifies spelling variants** (`Electronica` → `Electrónica`)
-- Converts **amounts** in US (`1,250.50`) or Latin American/European (`1.250,50`) format, with currency symbols or text
-- Converts **dates** in several formats (day-first)
-- Removes **empty rows, `TOTAL` rows and duplicates**
+- Maps different column names (Spanish or English) to a standard set via a simple **synonyms dictionary**, plus a `--map` option for anything else
+- Only **date and amount are required**; seller, category and product are optional
+- Cleans text (spaces, ALL CAPS / all lowercase) and **unifies spelling variants** (`Electronica` → `Electrónica`)
+- Converts **amounts** in US (`1,250.50`) or Latin American/European (`1.250,50`) format, with currency symbols or codes, and accounting negatives like `(350.00)`
+- Converts **dates** in several formats and **detects per file** whether `05/03/2026` means 5 March or May 3
+- **Detects currencies** (`USD`, `MXN`, `€`, `£`...) and, if files mix them, warns and splits the summaries by currency instead of adding them together
+- Removes **empty rows, `TOTAL` rows and exact duplicates** (a row is a duplicate only if *all* its original values match, so two identical sales on the same day are kept)
 - **Never invents data**: missing or unreadable values are left empty and reported
 - A broken file is **skipped with a clear message**; the rest are still processed
 - Clear error if the output file is open in Excel
@@ -137,6 +139,27 @@ Custom folders:
 python clean_reports.py --input path/to/reports --output path/to/results
 ```
 
+### Options
+
+| Option | What it does | Example |
+|---|---|---|
+| `--input`, `--output` | Input and output folders | `--input reports --output results` |
+| `--map "COLUMN=STANDARD"` | Use any column as `date`, `seller`, `category`, `product` or `amount` (repeatable) | `--map "coffee_name=product" --map "money=amount"` |
+| `--date-order` | `auto` (default, detected per file), `dmy` (5 March) or `mdy` (May 3) | `--date-order mdy` |
+| `--currency` | Currency for amounts that don't show one | `--currency MXN` |
+
+Run `python clean_reports.py --help` to see them all.
+
+### Tested with a real public dataset
+
+A Kaggle coffee-shop sales dataset (3,636 rows, English column names, no seller or category columns) runs with:
+
+```bash
+python clean_reports.py --input kaggle_data --output kaggle_report --map "coffee_name=product" --map "money=amount"
+```
+
+All 3,636 sales are kept, the cleaned total matches the original file to the cent, and the run takes about 10 seconds.
+
 Want to try it with fake data first? Generate the four messy sample files:
 
 ```bash
@@ -151,7 +174,7 @@ If your files use a column name the tool does not know yet (for example `Importe
 "amount": ["monto", "total", "importe", "amount", "amount (mxn)", "importe total"],
 ```
 
-No other code changes are needed.
+No other code changes are needed. For a one-off file, `--map` does the same without editing the code.
 
 ## Tests
 
@@ -159,13 +182,15 @@ No other code changes are needed.
 python -m pytest
 ```
 
-29 automated tests cover the amount and date parsers, column mapping, header detection, and full end-to-end runs, including a cross-check that the cleaned amounts of a file add up to that file's own `TOTAL` row.
+50 automated tests cover the amount, date and currency parsers, date-order detection, column mapping, header detection, and full end-to-end runs. They include a cross-check that the cleaned amounts of a file add up to that file's own `TOTAL` row, and a check that two identical sales on the same day are not removed as duplicates.
 
 ## Known limitations
 
-- Dates are interpreted **day-first** (`05/03/2026` = 5 March). US month-first files would need a setting change.
+- If a file's dates never show a number above 12 (e.g. only `01/02` … `12/12`), the order cannot be detected: day-first is assumed and the log says so. Use `--date-order` to force it.
 - An amount like `1.250` (a single dot followed by 3 digits) is read as `1.25`.
-- Title-casing turns `Ana de la Cruz` into `Ana De La Cruz`.
+- A bare `$` does not say which currency it is (USD, MXN, COP...); use `--currency`.
+- Currencies are detected, not converted: no exchange rates are applied.
+- Speed is about 3 ms per row (fine for typical office reports; files with hundreds of thousands of rows will take several minutes).
 - Older `.xls` files are not supported (save them as `.xlsx`).
 
 ## Project structure
