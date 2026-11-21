@@ -1,0 +1,16 @@
+# Virtual environment (each person creates their own)
+.venv/
+
+# Python cache files
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Generated report (anyone can recreate it by running the script)
+salida/
+
+# Temporary lock files Excel creates while a file is open
+~$*
+
+# Personal study notes (not part of the product)
+APRENDIZAJE.md
