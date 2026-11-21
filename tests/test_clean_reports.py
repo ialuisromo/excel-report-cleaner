@@ -22,9 +22,43 @@ import generate_sample_data
     ("-", None),
     ("", None),
     ("abc", None),               # garbage -> empty, not a crash
+    ("(350.00)", -350.0),        # accounting negative in parentheses
+    ("($1,250.50)", -1250.50),
 ])
 def test_parse_amount(raw, expected):
     assert cr.parse_amount(raw) == expected
+
+
+@pytest.mark.parametrize("raw, expected", [
+    ("1250.50 MXN", "MXN"),
+    ("usd 20", "USD"),
+    ("€1.250,50", "EUR"),
+    ("US$1,200", "USD"),
+    ("$1,200", None),            # bare $ is ambiguous -> default
+    (1200.0, None),              # plain number -> default
+])
+def test_detect_currency(raw, expected):
+    assert cr.detect_currency(raw) == expected
+
+
+def test_detect_currency_uses_default_when_unknown():
+    assert cr.detect_currency("$1,200", default="MXN") == "MXN"
+
+
+@pytest.mark.parametrize("values, expected", [
+    (["01/02/2026", "13/02/2026"], "dmy"),     # 13 can only be a day
+    (["01/02/2026", "02/13/2026"], "mdy"),     # 13 in second place -> month first
+    (["01/02/2026", "03/04/2026"], "unclear"), # every number <= 12
+    (["13/02/2026", "02/13/2026"], "unclear"), # contradictory file
+    (["2026-01-02", None], None),              # no short dates at all
+])
+def test_detect_date_order(values, expected):
+    assert cr.detect_date_order(values) == expected
+
+
+def test_parse_date_month_first():
+    assert cr.parse_date("11/8/2016", "mdy") == pd.Timestamp("2016-11-08")
+    assert cr.parse_date("11/8/2016", "dmy") == pd.Timestamp("2016-08-11")
 
 
 @pytest.mark.parametrize("raw, expected", [
@@ -49,7 +83,9 @@ def test_normalize_key_ignores_case_accents_and_spaces():
 
 
 def test_clean_text():
-    assert cr.clean_text("  ana   LÓPEZ ") == "Ana López"
+    assert cr.clean_text("  ana   lópez ") == "Ana López"      # all lower -> Title
+    assert cr.clean_text("JORGE TORRES") == "Jorge Torres"     # all upper -> Title
+    assert cr.clean_text("Americano with Milk") == "Americano with Milk"  # mixed: keep
     assert cr.clean_text("N/A") is None
 
 
@@ -66,13 +102,31 @@ def test_find_header_row_skips_title_rows():
 def test_standardize_columns_maps_synonyms():
     df = pd.DataFrame(columns=["FECHA", "Vendedor ", "Categoría", "Item", "Importe", "source_row"])
     result = cr.standardize_columns(df, "test.csv", log=[])
-    assert list(result.columns) == ["date", "seller", "category", "product", "amount", "source_row"]
+    assert list(result.columns) == ["date", "seller", "category", "product", "amount",
+                                    "source_row", "row_key"]
 
 
-def test_standardize_columns_missing_column_gives_clear_error():
+def test_standardize_columns_missing_required_column_gives_clear_error():
     df = pd.DataFrame(columns=["Fecha", "Vendedor", "source_row"])
-    with pytest.raises(ValueError, match="category"):
+    with pytest.raises(ValueError, match="amount"):
         cr.standardize_columns(df, "test.csv", log=[])
+
+
+def test_standardize_columns_optional_columns_become_empty():
+    df = pd.DataFrame({"Order Date": ["2026-01-01"], "Sales": [10], "source_row": [2]})
+    log = []
+    result = cr.standardize_columns(df, "test.csv", log)
+    assert result["seller"].isna().all()
+    assert "Optional column not found (left empty)" in {entry["action"] for entry in log}
+
+
+def test_standardize_columns_extra_mapping():
+    df = pd.DataFrame({"date": ["2026-01-01"], "money": [10], "coffee_name": ["Latte"],
+                       "source_row": [2]})
+    mappings = {"money": "amount", "coffee name": "product"}
+    result = cr.standardize_columns(df, "test.csv", log=[], extra_mappings=mappings)
+    assert result.loc[0, "amount"] == 10
+    assert result.loc[0, "product"] == "Latte"
 
 
 # ---------- End-to-end tests: the whole program ----------
@@ -82,7 +136,10 @@ def run_cleaner(input_dir, output_dir):
     exit_code = cr.main(["--input", str(input_dir), "--output", str(output_dir)])
     assert exit_code == 0
     report = output_dir / cr.OUTPUT_FILE_NAME
-    return pd.read_excel(report, sheet_name=None)  # dict: sheet name -> table
+    sheets = pd.read_excel(report, sheet_name=None)  # dict: sheet name -> table
+    # Summary has titles, not a header row: read it raw so A1 is a value
+    sheets["Summary"] = pd.read_excel(report, sheet_name="Summary", header=None)
+    return sheets
 
 
 def test_small_messy_files_end_to_end(tmp_path):
@@ -157,6 +214,65 @@ def test_dates_are_shown_without_time(tmp_path):
     run_cleaner(input_dir, tmp_path / "out")
     sheet = openpyxl.load_workbook(tmp_path / "out" / cr.OUTPUT_FILE_NAME)["Clean data"]
     assert sheet["A2"].number_format == "yyyy-mm-dd"
+
+
+def test_us_file_with_month_first_dates_and_no_seller(tmp_path):
+    """Kaggle-like file: English headers, m/d/Y dates, no seller/category columns,
+    and two DIFFERENT sales with the same date, product and price."""
+    input_dir = tmp_path / "in"
+    input_dir.mkdir()
+    (input_dir / "us.csv").write_text(
+        "Order Date,Order Time,Product Name,Sales\n"
+        "11/8/2016,10:15,Latte,38.70\n"
+        "11/8/2016,12:19,Latte,38.70\n"      # same day/product/price, different sale
+        "11/28/2016,09:00,Espresso,24.00\n",  # 28 -> file is month/day
+        encoding="utf-8",
+    )
+    sheets = run_cleaner(input_dir, tmp_path / "out")
+    clean = sheets["Clean data"]
+
+    assert len(clean) == 3                                    # nothing wrongly removed
+    assert set(clean["date"]) == {pd.Timestamp("2016-11-08"), pd.Timestamp("2016-11-28")}
+    assert clean["seller"].isna().all()
+    assert "Sales by month" in set(sheets["Summary"].iloc[:, 0])  # summary without category
+
+
+def test_map_option_end_to_end(tmp_path):
+    input_dir = tmp_path / "in"
+    input_dir.mkdir()
+    (input_dir / "coffee.csv").write_text(
+        "date,money,coffee_name\n2024-03-01,38.7,Latte\n", encoding="utf-8")
+    exit_code = cr.main(["--input", str(input_dir), "--output", str(tmp_path / "out"),
+                         "--map", "money=amount", "--map", "coffee_name=product"])
+    assert exit_code == 0
+
+
+def test_invalid_map_option_stops_with_message(tmp_path):
+    with pytest.raises(SystemExit):
+        cr.main(["--input", str(tmp_path), "--map", "money=price"])  # 'price' not standard
+
+
+def test_mixed_currencies_are_reported_and_split(tmp_path):
+    input_dir = tmp_path / "in"
+    input_dir.mkdir()
+    (input_dir / "a.csv").write_text(
+        "Fecha,Monto\n2026-01-01,100 USD\n2026-01-02,2000 MXN\n", encoding="utf-8")
+    sheets = run_cleaner(input_dir, tmp_path / "out")
+    titles = set(sheets["Summary"].iloc[:, 0].dropna())
+    assert {"Sales by month (MXN)", "Sales by month (USD)"} <= titles
+    assert any("Mixed currencies" in action for action in sheets["Corrections log"]["action"])
+
+
+def test_file_without_readable_dates_is_skipped_not_crash(tmp_path, capsys):
+    """Regression test: a 'Year' column (2006.0) used as date crashed the whole program."""
+    input_dir = tmp_path / "in"
+    input_dir.mkdir()
+    (input_dir / "games.csv").write_text(
+        "Year,Global_Sales\n2006.0,82.74\n1985.0,40.24\n", encoding="utf-8")
+    exit_code = cr.main(["--input", str(input_dir), "--output", str(tmp_path / "out"),
+                         "--map", "Year=date", "--map", "Global_Sales=amount"])
+    assert exit_code == 1                       # controlled error, no traceback
+    assert "could be read as a date" in capsys.readouterr().out
 
 
 def test_missing_input_folder_returns_error_code(tmp_path):

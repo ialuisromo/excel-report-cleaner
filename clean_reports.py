@@ -3,6 +3,8 @@
 Usage:
     python clean_reports.py
     python clean_reports.py --input other_folder --output results
+    python clean_reports.py --map "coffee_name=product" --map "money=amount"
+    python clean_reports.py --date-order mdy --currency USD
 """
 import argparse
 import numbers
@@ -26,14 +28,19 @@ SUPPORTED_EXTENSIONS = {".csv", ".xlsx"}
 # Standard column name -> names it may have in the source files.
 # Written normalized: lowercase, no accents, single spaces ("_" counts as a space).
 COLUMN_SYNONYMS = {
-    "date": ["fecha", "fecha venta", "date", "sale date"],
-    "seller": ["vendedor", "nombre vendedor", "salesperson", "seller"],
-    "category": ["categoria", "category"],
-    "product": ["producto", "item", "product"],
-    "amount": ["monto", "total", "importe", "amount", "amount (mxn)"],
+    "date": ["fecha", "fecha venta", "date", "sale date", "order date", "invoice date",
+             "transaction date"],
+    "seller": ["vendedor", "nombre vendedor", "salesperson", "seller", "sales rep",
+               "sales person", "employee", "agent"],
+    "category": ["categoria", "category", "product category"],
+    "product": ["producto", "item", "product", "product name", "product line", "description"],
+    "amount": ["monto", "total", "importe", "amount", "amount (mxn)", "sales", "revenue",
+               "total amount"],
 }
 STANDARD_COLUMNS = list(COLUMN_SYNONYMS)
+REQUIRED_COLUMNS = ["date", "amount"]          # the others are optional
 TEXT_COLUMNS = ["seller", "category", "product"]
+OUTPUT_COLUMNS = STANDARD_COLUMNS + ["currency", "source_file", "source_row"]
 
 # Reverse lookup: "importe" -> "amount", "vendedor" -> "seller", ...
 SYNONYM_LOOKUP = {}
@@ -41,7 +48,18 @@ for standard_name, synonyms in COLUMN_SYNONYMS.items():
     for synonym in synonyms:
         SYNONYM_LOOKUP[synonym] = standard_name
 
-DATE_FORMATS = ["%Y-%m-%d", "%d/%m/%Y", "%Y/%m/%d", "%d-%m-%Y"]  # day-first (Mexico)
+# Date formats. ISO-like formats (year first) are never ambiguous.
+ISO_DATE_FORMATS = ["%Y-%m-%d", "%Y/%m/%d", "%Y-%m-%d %H:%M:%S"]
+DATE_FORMATS = {
+    "dmy": ISO_DATE_FORMATS + ["%d/%m/%Y", "%d-%m-%Y"],   # 05/03/2026 = 5 March
+    "mdy": ISO_DATE_FORMATS + ["%m/%d/%Y", "%m-%d-%Y"],   # 05/03/2026 = May 3
+}
+SHORT_DATE = re.compile(r"\s*(\d{1,2})[/-](\d{1,2})[/-]\d{4}")  # 05/03/2026 or 5-3-2026
+
+# Currency markers. A bare "$" is NOT here on purpose: it is used by USD, MXN, COP...
+CURRENCY_CODES = {"USD", "MXN", "EUR", "GBP", "CAD", "COP", "ARS", "CLP", "PEN", "BRL", "UAH"}
+CURRENCY_SYMBOLS = {"US$": "USD", "€": "EUR", "£": "GBP", "₴": "UAH"}
+
 MISSING_VALUES = {"", "-", "n/a", "na", "nan", "none", "null"}
 LOG_COLUMNS = ["file", "row", "column", "action", "before", "after"]
 
@@ -133,26 +151,49 @@ def read_file(path):
 
 # ---------- Step 3: standard column names ----------
 
-def standardize_columns(df, file_name, log):
-    """Rename columns to the standard names. Raise a clear error if one is missing."""
+def make_row_key(df, columns):
+    """One normalized text per row joining ALL its original values.
+    Two rows are duplicates only if this whole text is identical."""
+    keys = []
+    for _, row in df[columns].iterrows():
+        keys.append(" | ".join(normalize_key(value) for value in row))
+    return keys
+
+
+def standardize_columns(df, file_name, log, extra_mappings=None):
+    """Rename columns to the standard names.
+    Required columns missing -> clear error. Optional ones missing -> empty column."""
+    extra_mappings = extra_mappings or {}   # from --map, checked before the synonyms
+    original_columns = [column for column in df.columns if column != "source_row"]
+
     renames = {}
-    for column in df.columns:
-        standard_name = SYNONYM_LOOKUP.get(normalize_key(column))
+    for column in original_columns:
+        key = normalize_key(column)
+        standard_name = extra_mappings.get(key) or SYNONYM_LOOKUP.get(key)
         if standard_name and standard_name not in renames.values():
             renames[column] = standard_name
 
-    missing = [name for name in STANDARD_COLUMNS if name not in renames.values()]
+    missing = [name for name in REQUIRED_COLUMNS if name not in renames.values()]
     if missing:
         raise ValueError(
-            f"could not find column(s) {missing}. Columns in file: {list(df.columns)}"
+            f"could not find required column(s) {missing}. "
+            f"Columns in file: {original_columns}. "
+            f'Tip: use --map "your column=standard name"'
         )
 
     for original, standard_name in renames.items():
         if original != standard_name:
             add_log(log, file_name, "", original, "Renamed column", original, standard_name)
 
-    df = df.rename(columns=renames)
-    return df[STANDARD_COLUMNS + ["source_row"]]  # drop any extra columns
+    df["row_key"] = make_row_key(df, original_columns)
+    df = df[list(renames) + ["source_row", "row_key"]].rename(columns=renames)
+
+    for name in STANDARD_COLUMNS:
+        if name not in df.columns:
+            df[name] = None
+            add_log(log, file_name, "", name, "Optional column not found (left empty)")
+
+    return df[STANDARD_COLUMNS + ["source_row", "row_key"]]
 
 
 # ---------- Step 4: cleaning values ----------
@@ -176,20 +217,39 @@ def remove_empty_and_total_rows(df, file_name, log):
 
 
 def clean_text(value):
-    """'  ana   LÓPEZ ' -> 'Ana López'."""
+    """Fix spaces always; fix capitalization only if the text is ALL UPPER or all lower.
+    '  ana   lópez ' -> 'Ana López', 'JORGE' -> 'Jorge',
+    'Americano with Milk' and 'Ana de la Cruz' stay as they are."""
     if is_missing(value):
         return None
-    return " ".join(str(value).split()).title()
+    text = " ".join(str(value).split())
+    if text.isupper() or text.islower():
+        text = text.title()
+    return text
+
+
+def detect_currency(value, default=None):
+    """'1250.50 MXN' -> 'MXN', '€5' -> 'EUR'. Numbers or a bare '$' -> default."""
+    if isinstance(value, str):
+        for word in re.findall(r"[A-Za-z]{3}", value):
+            if word.upper() in CURRENCY_CODES:
+                return word.upper()
+        for symbol, code in CURRENCY_SYMBOLS.items():
+            if symbol in value:
+                return code
+    return default
 
 
 def parse_amount(value):
-    """'$1,250.50', '1.250,50', '1250.50 MXN' or 1250.5 -> 1250.5 (None if empty)."""
+    """'$1,250.50', '1.250,50', '1250.50 MXN', '(350.00)' or 1250.5 -> number."""
     if is_missing(value):
         return None
     if isinstance(value, numbers.Number):
         return float(value)
 
-    text = re.sub(r"[^\d,.\-]", "", str(value))  # keep only digits , . and -
+    raw = str(value).strip()
+    in_parentheses = raw.startswith("(") and raw.endswith(")")  # accounting negative
+    text = re.sub(r"[^\d,.\-]", "", raw)  # keep only digits , . and -
     if text in ("", "-"):
         return None
 
@@ -209,24 +269,59 @@ def parse_amount(value):
         text = text.replace(".", "")        # 1.250.000 -> thousands
 
     try:
-        return float(text)
+        number = float(text)
     except ValueError:
         return None
+    return -abs(number) if in_parentheses else number
 
 
-def parse_date(value):
-    """Real dates stay as they are; texts are tried against DATE_FORMATS."""
+def detect_date_order(values):
+    """Look at dates like 05/03/2026 and decide the order for the whole file:
+    'dmy' if some first number > 12, 'mdy' if some second number > 12,
+    'unclear' if it cannot be decided, None if there are no such dates."""
+    found = day_first = month_first = False
+    for value in values:
+        match = SHORT_DATE.match(str(value)) if isinstance(value, str) else None
+        if match:
+            found = True
+            first, second = int(match.group(1)), int(match.group(2))
+            day_first = day_first or first > 12
+            month_first = month_first or second > 12
+    if not found:
+        return None
+    if day_first and not month_first:
+        return "dmy"
+    if month_first and not day_first:
+        return "mdy"
+    return "unclear"
+
+
+def parse_date(value, date_order="dmy"):
+    """Real dates stay as they are; texts are tried against the formats of date_order."""
     if is_missing(value):
         return None
     if isinstance(value, datetime):          # pandas Timestamp is a datetime too
         return pd.Timestamp(value)
     text = str(value).strip()
-    for date_format in DATE_FORMATS:
+    for date_format in DATE_FORMATS[date_order]:
         try:
             return pd.Timestamp(datetime.strptime(text, date_format))
         except ValueError:
             continue  # not this format -> try the next one
     return None
+
+
+def choose_date_order(values, setting, file_name, log):
+    """Use --date-order if given; otherwise detect it from this file's dates."""
+    if setting != "auto":
+        return setting
+    detected = detect_date_order(values)
+    if detected == "unclear":
+        add_log(log, file_name, "", "date", "Date order unclear, assumed day/month")
+        return "dmy"
+    if detected == "mdy":
+        add_log(log, file_name, "", "date", "Detected month/day date order")
+    return detected or "dmy"
 
 
 def clean_column(df, column, cleaner, action, file_name, log):
@@ -238,23 +333,40 @@ def clean_column(df, column, cleaner, action, file_name, log):
             note = ("Missing value (left empty)" if is_missing(value)
                     else "Could not interpret value (left empty)")
             add_log(log, file_name, source_row, column, note, value)
-        elif new_value != value:
+        elif as_log_text(new_value) != as_log_text(value):
+            # only log visible changes: text '2024-03-01' -> date 2024-03-01 is not one
             add_log(log, file_name, source_row, column, action, value, new_value)
         new_values.append(new_value)
     df[column] = new_values
 
 
-def clean_file(path, log):
-    """Read and clean one file. Returns a table with the standard columns."""
+def clean_file(path, log, options):
+    """Read and clean one file. Returns a table with the output columns + row_key."""
     df = read_file(path)
-    df = standardize_columns(df, path.name, log)
+    df = standardize_columns(df, path.name, log, options.mappings)
     df = remove_empty_and_total_rows(df, path.name, log)
+
     for column in TEXT_COLUMNS:
-        clean_column(df, column, clean_text, "Fixed spaces/capitalization", path.name, log)
-    clean_column(df, "date", parse_date, "Converted text to date", path.name, log)
+        if df[column].notna().any():   # skip optional columns the file does not have
+            clean_column(df, column, clean_text, "Fixed spaces/capitalization", path.name, log)
+
+    date_order = choose_date_order(df["date"], options.date_order, path.name, log)
+    original_dates = df["date"].dropna().head(3).tolist()
+    clean_column(df, "date", lambda value: parse_date(value, date_order),
+                 "Converted text to date", path.name, log)
+    if len(df) and df["date"].isna().all():
+        raise ValueError(f"no value in the date column could be read as a date "
+                         f"(examples: {original_dates})")
+
+    df["currency"] = [detect_currency(value, options.currency) for value in df["amount"]]
+    original_amounts = df["amount"].dropna().head(3).tolist()
     clean_column(df, "amount", parse_amount, "Converted text to number", path.name, log)
+    if len(df) and df["amount"].isna().all():
+        raise ValueError(f"no value in the amount column could be read as a number "
+                         f"(examples: {original_amounts})")
+
     df["source_file"] = path.name
-    return df[STANDARD_COLUMNS + ["source_file", "source_row"]]
+    return df[OUTPUT_COLUMNS + ["row_key"]]
 
 
 # ---------- Step 5: consolidating ----------
@@ -280,8 +392,10 @@ def unify_text_variants(df, log):
 
 
 def remove_duplicates(df, log):
-    """Drop rows identical in all business columns (keeps the first one)."""
-    is_duplicate = df.duplicated(subset=STANDARD_COLUMNS, keep="first")
+    """Drop rows whose ORIGINAL values are all identical (keeps the first one).
+    Comparing only date+product+amount would delete real sales, e.g. two
+    lattes sold the same day at the same price."""
+    is_duplicate = df.duplicated(subset=["row_key"], keep="first")
     for file_name, row in zip(df.loc[is_duplicate, "source_file"],
                               df.loc[is_duplicate, "source_row"]):
         add_log(log, file_name, row, "-", "Removed duplicate row")
@@ -290,29 +404,57 @@ def remove_duplicates(df, log):
 
 # ---------- Step 6: summaries ----------
 
-def build_summaries(df, log_df):
-    """Return three summary tables: by month x category, by seller, corrections."""
-    valid = df.dropna(subset=["date", "amount"])
-    valid = valid.assign(month=valid["date"].dt.strftime("%Y-%m"))
+def month_table(part):
+    """Month x category with totals; just totals per month if there is no category."""
+    if part["category"].notna().any():
+        table = pd.pivot_table(
+            part.fillna({"category": "(none)"}), index="month", columns="category",
+            values="amount", aggfunc="sum", fill_value=0, margins=True, margins_name="Total",
+        ).reset_index()
+        table.columns.name = None
+        return table
+    table = part.groupby("month")["amount"].agg(sales="count", total="sum").reset_index()
+    total_row = pd.DataFrame([{"month": "Total", "sales": table["sales"].sum(),
+                               "total": table["total"].sum()}])
+    return pd.concat([table, total_row], ignore_index=True)
 
-    by_month = pd.pivot_table(
-        valid, index="month", columns="category", values="amount",
-        aggfunc="sum", fill_value=0, margins=True, margins_name="Total",
-    ).reset_index()
-    by_month.columns.name = None
 
-    by_seller = (
-        valid.groupby("seller")["amount"]
+def dimension_table(part, column):
+    """Sales count, total and average per seller / product."""
+    return (
+        part.groupby(column)["amount"]
         .agg(sales="count", total="sum", average="mean")
         .sort_values("total", ascending=False)
         .reset_index()
     )
 
+
+def build_summaries(df, log_df):
+    """Return a list of (title, table). Split by currency if there is more than one."""
+    valid = df.dropna(subset=["date", "amount"])
+    valid = valid.assign(month=valid["date"].dt.strftime("%Y-%m"))
+
+    if valid["currency"].nunique() > 1:
+        valid = valid.fillna({"currency": "unspecified"})
+        groups = [(f" ({currency})", part) for currency, part in valid.groupby("currency")]
+    else:
+        groups = [("", valid)]
+
+    tables = []
+    for suffix, part in groups:
+        has_category = part["category"].notna().any()
+        title = "Sales by month and category" if has_category else "Sales by month"
+        tables.append((title + suffix, month_table(part)))
+        for column in ["seller", "product"]:
+            if part[column].notna().any():
+                tables.append((f"Sales by {column}{suffix}", dimension_table(part, column)))
+
     corrections = (
         log_df["action"].value_counts()
         .rename_axis("correction").reset_index(name="times")
     )
-    return by_month, by_seller, corrections
+    tables.append(("Corrections made", corrections))
+    return tables
 
 
 # ---------- Step 7: writing the Excel report ----------
@@ -335,19 +477,14 @@ def format_sheet(sheet, freeze_header=True):
 
 def write_report(clean_df, log_df, output_path):
     """Write the 3-sheet Excel report."""
-    by_month, by_seller, corrections = build_summaries(clean_df, log_df)
+    tables = build_summaries(clean_df, log_df)
 
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
         clean_df.to_excel(writer, sheet_name="Clean data", index=False)
 
-        # Summary sheet: three tables one below the other, each with a title
+        # Summary sheet: tables one below the other, each with a bold title
         start = 1
-        titles_and_tables = [
-            ("Sales by month and category", by_month),
-            ("Sales by seller", by_seller),
-            ("Corrections made", corrections),
-        ]
-        for title, table in titles_and_tables:
+        for title, table in tables:
             table.to_excel(writer, sheet_name="Summary", startrow=start, index=False)
             title_cell = writer.sheets["Summary"].cell(row=start, column=1, value=title)
             title_cell.font = Font(bold=True, size=13)
@@ -362,6 +499,18 @@ def write_report(clean_df, log_df, output_path):
 
 # ---------- Step 8: command line ----------
 
+def parse_mappings(pairs, parser):
+    """['coffee_name=product'] -> {'coffee name': 'product'}."""
+    mappings = {}
+    for pair in pairs:
+        source, _, target = pair.partition("=")
+        target = target.strip().lower()
+        if not source.strip() or target not in STANDARD_COLUMNS:
+            parser.error(f'invalid --map "{pair}". Use "column name=one of {STANDARD_COLUMNS}"')
+        mappings[normalize_key(source)] = target
+    return mappings
+
+
 def parse_args(argv=None):
     """argv=None reads the real command line; tests can pass a list instead."""
     parser = argparse.ArgumentParser(description="Clean and consolidate messy sales reports.")
@@ -369,7 +518,17 @@ def parse_args(argv=None):
                         help="folder with the Excel/CSV files (default: entrada/)")
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT_DIR,
                         help="folder for the report (default: salida/)")
-    return parser.parse_args(argv)
+    parser.add_argument("--map", action="append", default=[], metavar="COLUMN=STANDARD",
+                        help='use a column as a standard one, e.g. --map "coffee_name=product" '
+                             "(repeatable)")
+    parser.add_argument("--date-order", choices=["auto", "dmy", "mdy"], default="auto",
+                        help="dmy = 05/03 is 5 March, mdy = May 3 (default: detect per file)")
+    parser.add_argument("--currency", default=None,
+                        help="currency for amounts that do not show one, e.g. MXN")
+    args = parser.parse_args(argv)
+    args.mappings = parse_mappings(args.map, parser)
+    args.currency = args.currency.upper() if args.currency else None
+    return args
 
 
 def main(argv=None):
@@ -388,7 +547,7 @@ def main(argv=None):
     print(f"Reading {len(files)} file(s) from {args.input}")
     for path in files:
         try:
-            tables.append(clean_file(path, log))
+            tables.append(clean_file(path, log, args))
             print(f"  OK       {path.name}")
         except Exception as error:  # one bad file must not stop the others
             print(f"  SKIPPED  {path.name}: {error}")
@@ -399,7 +558,15 @@ def main(argv=None):
     data = pd.concat(tables, ignore_index=True)
     unify_text_variants(data, log)
     data = remove_duplicates(data, log)
+    data = data.drop(columns="row_key")
+    data["date"] = pd.to_datetime(data["date"])  # guarantee a real date column
     data = data.sort_values(["date", "source_file", "source_row"]).reset_index(drop=True)
+
+    currencies = sorted(data["currency"].dropna().unique())
+    if len(currencies) > 1:
+        message = f"Mixed currencies {currencies}: summaries are split by currency"
+        add_log(log, "", "", "currency", message)
+        print(f"\nWARNING: {message}")
 
     log_df = pd.DataFrame(log, columns=LOG_COLUMNS)
     args.output.mkdir(parents=True, exist_ok=True)
